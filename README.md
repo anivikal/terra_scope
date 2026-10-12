@@ -24,7 +24,9 @@ Gemini is called only when you press **Ask Gemini**. That request sends a Terraf
 
 - Resources, modules, variables, outputs, locals, and data sources.
 - Direct resource references, displayed as dependencies.
-- Explicit S3 notifications, Lambda event-source mappings, EventBridge targets, and SNS subscriptions, displayed as runtime flows.
+- Direct resource references include the consuming attribute, Terraform expression, and referenced value.
+- Explicit S3 notifications, Lambda event-source mappings, EventBridge targets, and SNS subscriptions, displayed as event paths through their trigger resources.
+- Interactive architecture graph supports resource rearrangement, pan/zoom, connection filtering, flow animation, and selected connection details.
 - Selected configuration signals for S3, IAM, security groups, and RDS.
 - Broad, low-confidence monthly cost ranges for common AWS resource types.
 - A deterministic, source-grounded architecture summary; the core analyzer does not require credentials.

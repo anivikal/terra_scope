@@ -50,7 +50,9 @@ RUNTIME_RESOURCE_TYPES = {
 BLOCK_HEADER = re.compile(
     r'(?m)^[ \t]*(resource|data|module|variable|output|locals|provider|terraform)\b'
 )
-REFERENCE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_-]+)")
+REFERENCE = re.compile(r"\b(?:(data)\.)?([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_-]+)")
+REFERENCE_SUFFIX = re.compile(r"\.([A-Za-z_][A-Za-z0-9_-]*)")
+REFERENCE_ASSIGNMENT = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.*?)\s*(?:#.*)?$")
 ASSIGNMENT = re.compile(
     r'(?m)^[ \t]*([A-Za-z_][A-Za-z0-9_-]*)[ \t]*=[ \t]*(?:"([^"]*)"|([^\s#]+))'
 )
@@ -169,6 +171,11 @@ def _resource_id(block: Block) -> str:
     if block.kind == "module":
         return f"module.{block.labels[0]}"
     return f"{block.labels[0]}.{block.labels[1]}"
+
+
+def _reference_id(match: re.Match[str]) -> str:
+    prefix = "data." if match.group(1) == "data" else ""
+    return f"{prefix}{match.group(2)}.{match.group(3)}"
 
 
 def _knowledge(resource_type: str) -> tuple[str, str, str]:
@@ -397,7 +404,7 @@ def analyze_files(files: dict[str, str]) -> dict[str, Any]:
                 continue
             related_block = raw_blocks[related["id"]][0]
             references_bucket = any(
-                f"{match.group(1)}.{match.group(2)}" == bucket["id"]
+                _reference_id(match) == bucket["id"]
                 for match in REFERENCE.finditer(related_block.body)
             )
             if not references_bucket:
@@ -428,55 +435,106 @@ def analyze_files(files: dict[str, str]) -> dict[str, Any]:
     edges: list[dict[str, str]] = []
     runtime_edges: list[dict[str, str]] = []
     edge_keys: set[tuple[str, str, str]] = set()
+    by_id = {resource["id"]: resource for resource in resources}
     for resource in resources:
         block, _ = raw_blocks[resource["id"]]
         for match in REFERENCE.finditer(block.body):
-            referenced_id = f"{match.group(1)}.{match.group(2)}"
+            referenced_id = _reference_id(match)
             if referenced_id not in resource_ids or referenced_id == resource["id"]:
                 continue
-            if (referenced_id, resource["id"], "depends_on") not in edge_keys:
-                edges.append({"source": referenced_id, "target": resource["id"], "kind": "depends_on"})
-                edge_keys.add((referenced_id, resource["id"], "depends_on"))
+            line_start = block.body.rfind("\n", 0, match.start()) + 1
+            line_end = block.body.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(block.body)
+            line = block.body[line_start:line_end]
+            assignment = REFERENCE_ASSIGNMENT.match(line)
+            if not assignment:
+                continue
+            attribute = assignment.group(1)
+            expression = assignment.group(2).strip().rstrip(",")
+            reference_start = expression.find(match.group(0))
+            value_suffix = (
+                expression[reference_start + len(match.group(0)):]
+                if reference_start >= 0
+                else ""
+            )
+            referenced_value = ".".join(REFERENCE_SUFFIX.findall(value_suffix))
+            key = (referenced_id, resource["id"], attribute)
+            if key in edge_keys:
+                continue
+            edge_keys.add(key)
+            source_resource = by_id[referenced_id]
+            target_resource = by_id[resource["id"]]
+            relationship = (
+                f"{target_resource['service']} uses {source_resource['service']}"
+                f"{f' {referenced_value}' if referenced_value else ''} for {attribute}."
+            )
+            edges.append({
+                "source": referenced_id,
+                "target": resource["id"],
+                "kind": "reference",
+                "attribute": attribute,
+                "expression": expression,
+                "referenced_value": referenced_value,
+                "description": relationship,
+            })
 
-    def add_runtime(source: str, target: str, label: str) -> None:
+    def add_runtime(source: str, target: str, label: str, via: str, event: str) -> None:
         if source in resource_ids and target in resource_ids and source != target:
-            if not any(edge["source"] == source and edge["target"] == target for edge in runtime_edges):
-                runtime_edges.append({"source": source, "target": target, "label": label})
+            if not any(
+                edge["source"] == source
+                and edge["target"] == target
+                and edge["via"] == via
+                for edge in runtime_edges
+            ):
+                runtime_edges.append({
+                    "source": source,
+                    "target": target,
+                    "label": label,
+                    "via": via,
+                    "event": event,
+                    "description": (
+                        f"{by_id[source]['service']} triggers {by_id[target]['service']}"
+                        f" via {by_id[via]['service']}"
+                        f"{f' when {event}' if event else ''}."
+                    ),
+                })
 
-    by_id = {resource["id"]: resource for resource in resources}
     for resource in resources:
         if resource["type"] not in RUNTIME_RESOURCE_TYPES:
             continue
         block, _ = raw_blocks[resource["id"]]
         referenced = {
-            f"{match.group(1)}.{match.group(2)}"
+            _reference_id(match)
             for match in REFERENCE.finditer(block.body)
         }
         candidates = [by_id[item] for item in referenced if item in by_id]
+        event_match = re.search(r"\bevents\s*=\s*\[([^\]]*)\]", block.body)
+        event = ", ".join(re.findall(r'"([^"]+)"', event_match.group(1))) if event_match else ""
         if resource["type"] == "aws_s3_bucket_notification":
             buckets = [item for item in candidates if item["type"] == "aws_s3_bucket"]
             functions = [item for item in candidates if item["type"] == "aws_lambda_function"]
             for bucket in buckets:
                 for function in functions:
-                    add_runtime(bucket["id"], function["id"], "Object event")
+                    add_runtime(bucket["id"], function["id"], "Object event", resource["id"], event)
         elif resource["type"] == "aws_lambda_event_source_mapping":
             sources = [item for item in candidates if item["type"] in {"aws_sqs_queue", "aws_dynamodb_table"}]
             functions = [item for item in candidates if item["type"] == "aws_lambda_function"]
             for source in sources:
                 for function in functions:
-                    add_runtime(source["id"], function["id"], "Event source")
+                    add_runtime(source["id"], function["id"], "Event source", resource["id"], event)
         elif resource["type"] == "aws_cloudwatch_event_target":
             rules = [item for item in candidates if item["type"] == "aws_cloudwatch_event_rule"]
             targets = [item for item in candidates if item["type"] in {"aws_lambda_function", "aws_sns_topic", "aws_sqs_queue"}]
             for rule in rules:
                 for target in targets:
-                    add_runtime(rule["id"], target["id"], "Matched event")
+                    add_runtime(rule["id"], target["id"], "Matched event", resource["id"], event)
         elif resource["type"] == "aws_sns_topic_subscription":
             topics = [item for item in candidates if item["type"] == "aws_sns_topic"]
             endpoints = [item for item in candidates if item["id"] != topics[0]["id"]] if topics else []
             for topic in topics:
                 for endpoint in endpoints:
-                    add_runtime(topic["id"], endpoint["id"], "Notification")
+                    add_runtime(topic["id"], endpoint["id"], "Notification", resource["id"], event)
 
     flattened_risks = [
         {"resource_id": resource["id"], **risk}

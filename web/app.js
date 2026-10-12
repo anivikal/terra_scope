@@ -51,7 +51,19 @@ output "upload_bucket_name" {
 }`
 };
 
-const state = {analysis: null, files: null, geminiEnabled: false, view: "overview", toastTimer: null};
+const state = {
+  analysis: null,
+  files: null,
+  geminiEnabled: false,
+  graphMode: "all",
+  graphPlaying: false,
+  selectedGraphNode: null,
+  selectedConnection: null,
+  graphPositions: new Map(),
+  graphTransform: {x: 0, y: 0, scale: 1},
+  view: "overview",
+  toastTimer: null
+};
 const $ = (selector) => document.querySelector(selector);
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
@@ -140,6 +152,10 @@ async function analyzeFiles(files, projectName) {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Analysis failed.");
+    state.graphPositions = new Map();
+    state.graphTransform = {x: 0, y: 0, scale: 1};
+    state.graphPlaying = false;
+    state.graphMode = "all";
     state.analysis = result;
     state.files = files;
     state.analysis.project.name = projectName || result.project.name;
@@ -263,8 +279,12 @@ function renderActivePanel() {
   };
   panel.innerHTML = (renderers[state.view] || renderOverview)();
   panel.querySelectorAll("[data-resource-id]").forEach((element) => {
-    element.addEventListener("click", () => openResource(element.dataset.resourceId));
+    element.addEventListener("click", () => {
+      if (state.view === "architecture" && element.closest("#architecture-graph")) return;
+      openResource(element.dataset.resourceId);
+    });
   });
+  if (state.view === "architecture") initializeArchitectureGraph();
 }
 
 function nodeIcon(category) {
@@ -288,19 +308,361 @@ function renderOverview() {
 
 function renderArchitecture() {
   const data = state.analysis;
-  const resourceById = new Map(data.resources.map((resource) => [resource.id, resource]));
-  const usedTargets = new Set(data.edges.map((edge) => edge.target));
-  const roots = data.resources.filter((resource) => !usedTargets.has(resource.id));
-  const start = roots.length ? roots : data.resources;
-  const ordered = [...start, ...data.resources.filter((resource) => !start.includes(resource))].slice(0, 18);
-  const nodeMarkup = ordered.map((resource, index) => {
-    const [iconClass, icon] = nodeIcon(resource.category);
-    const next = ordered[index + 1];
-    const connected = next && data.edges.some((edge) => edge.source === resource.id && edge.target === next.id);
-    return `<button class="resource-node" data-resource-id="${escapeHtml(resource.id)}"><div class="node-top"><span class="node-icon ${iconClass}">${icon}</span><span><span class="node-name">${escapeHtml(resource.service)}</span><span class="node-type">${escapeHtml(resource.id)}</span></span></div><div class="node-caption">${escapeHtml(resource.purpose)}</div></button>${next ? `<span class="diagram-arrow">${connected ? "→" : "·"}<span>${connected ? "references" : "not directly linked"}</span></span>` : ""}`;
-  }).join("");
-  const links = data.edges.map((edge) => `<div class="property-row"><span>${escapeHtml(resourceById.get(edge.source)?.service || edge.source)} → ${escapeHtml(resourceById.get(edge.target)?.service || edge.target)}</span><strong>Explicit dependency</strong></div>`).join("");
-  return `<div class="panel-heading"><div><h2>Infrastructure map</h2><div class="panel-subtitle">Resource references inferred directly from Terraform expressions.</div></div><span class="pill">${data.edges.length} dependencies</span></div><div class="architecture-canvas">${nodeMarkup ? `<div class="diagram-row">${nodeMarkup}</div>` : '<div class="empty-state">Upload Terraform to map its resources.</div>'}</div><div class="drawer-section"><h3>Detected dependencies</h3>${links || '<div class="empty-state">No explicit resource-to-resource references were detected.</div>'}</div>`;
+  const nodeLimit = 80;
+  const resources = data.resources.slice(0, nodeLimit);
+  const ids = new Set(resources.map((resource) => resource.id));
+  const runtimeConnections = data.runtime_flows.flatMap((flow) => {
+    if (!ids.has(flow.via)) return [{...flow, flowType: "runtime"}];
+    const source = data.resources.find((resource) => resource.id === flow.source);
+    const target = data.resources.find((resource) => resource.id === flow.target);
+    const trigger = data.resources.find((resource) => resource.id === flow.via);
+    const eventText = flow.event ? ` for ${flow.event}` : "";
+    return [
+      {
+        ...flow,
+        target: flow.via,
+        flowType: "runtime",
+        runtimeStep: "trigger",
+        description: `${source?.service || flow.source} event${eventText} is wired through ${trigger?.service || flow.via}.`
+      },
+      {
+        ...flow,
+        source: flow.via,
+        flowType: "runtime",
+        runtimeStep: "delivery",
+        description: `${trigger?.service || flow.via} routes${eventText} to ${target?.service || flow.target}.`
+      }
+    ];
+  }).filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+  const connections = [
+    ...data.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)).map((edge) => ({...edge, flowType: "reference"})),
+    ...runtimeConnections
+  ];
+  const visibleConnections = state.graphMode === "runtime"
+    ? connections.filter((edge) => edge.flowType === "runtime")
+    : connections;
+  state.graphConnections = visibleConnections;
+  const graph = layoutGraph(resources, visibleConnections);
+  state.graphDimensions = graph;
+  const connectionsCount = state.graphMode === "runtime" ? runtimeConnections.length : data.edges.length + runtimeConnections.length;
+  const connectionMarkup = visibleConnections.map((connection, index) => (
+    `<g class="graph-connection ${connection.flowType}" data-connection-index="${index}">`
+    + `<path class="connection-line" marker-end="url(#arrow-${connection.flowType})"></path>`
+    + '<path class="connection-hit"></path>'
+    + `<text class="connection-label"><textPath href="#connection-path-${index}" startOffset="50%" text-anchor="middle">${escapeHtml(connection.flowType === "runtime" ? (connection.event || connection.label) : (connection.attribute || "reference"))}</textPath></text>`
+    + "</g>"
+  )).join("");
+  const nodeMarkup = resources.map((resource) => (
+    graphNodeMarkup(resource, graph.positions.get(resource.id))
+  )).join("");
+  return `
+    <div class="panel-heading"><div><h2>Interactive architecture map</h2><div class="panel-subtitle">Drag resources to rearrange · Click a connection for its source, target, and configuration details.</div></div><span class="pill">${connectionsCount} connections</span></div>
+    <div class="graph-toolbar">
+      <div class="graph-filters">
+        <button class="graph-filter ${state.graphMode === "all" ? "active" : ""}" data-graph-mode="all">All connections <span>${data.edges.length + runtimeConnections.length}</span></button>
+        <button class="graph-filter ${state.graphMode === "runtime" ? "active" : ""}" data-graph-mode="runtime">Runtime flow <span>${runtimeConnections.length}</span></button>
+      </div>
+      <div class="graph-controls">
+        <button class="graph-control" data-graph-action="zoom-out" aria-label="Zoom out">−</button>
+        <button class="graph-control" data-graph-action="zoom-in" aria-label="Zoom in">+</button>
+        <button class="graph-control graph-fit" data-graph-action="fit">Fit map</button>
+        <button class="graph-control graph-play ${state.graphPlaying ? "active" : ""}" data-graph-action="play">${state.graphPlaying ? "Ⅱ Pause flow" : "▶ Play flow"}</button>
+      </div>
+    </div>
+    <div class="graph-legend"><span><i class="legend-line dependency"></i>Terraform reference</span><span><i class="legend-line runtime"></i>Inferred event flow</span><span class="graph-hint">Scroll to zoom · Drag empty space to pan</span></div>
+    <div class="graph-viewport" id="graph-viewport">
+      <svg class="graph-svg" id="architecture-graph" role="img" aria-label="Interactive Terraform resource connection graph" viewBox="0 0 ${graph.width} ${graph.height}" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <marker id="arrow-reference" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#9da6b4"></path></marker>
+          <marker id="arrow-runtime" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#756bec"></path></marker>
+        </defs>
+        <g id="graph-world">
+          <g id="graph-nodes">${nodeMarkup}</g>
+          <g id="graph-connections">${connectionMarkup}</g>
+        </g>
+      </svg>
+    </div>
+    ${resources.length < data.resources.length ? `<div class="graph-truncation">Showing ${resources.length} of ${data.resources.length} resources to keep the graph responsive.</div>` : ""}
+    <div class="graph-inspector" id="graph-inspector"><div class="graph-inspector-empty"><span>↖</span><strong>Select a resource or connection</strong><small>Inspect what connects services and how Terraform wires them together.</small></div></div>`;
+}
+
+function layoutGraph(resources, connections) {
+  const ids = new Set(resources.map((resource) => resource.id));
+  const incoming = new Map(resources.map((resource) => [resource.id, 0]));
+  const outgoing = new Map(resources.map((resource) => [resource.id, []]));
+  for (const connection of connections) {
+    if (!ids.has(connection.source) || !ids.has(connection.target)) continue;
+    outgoing.get(connection.source).push(connection.target);
+    incoming.set(connection.target, incoming.get(connection.target) + 1);
+  }
+  const queue = resources.filter((resource) => incoming.get(resource.id) === 0).map((resource) => resource.id);
+  const levels = new Map(resources.map((resource) => [resource.id, 0]));
+  const visited = new Set();
+  while (queue.length) {
+    const source = queue.shift();
+    if (visited.has(source)) continue;
+    visited.add(source);
+    for (const target of outgoing.get(source)) {
+      levels.set(target, Math.max(levels.get(target), levels.get(source) + 1));
+      incoming.set(target, incoming.get(target) - 1);
+      if (incoming.get(target) === 0) queue.push(target);
+    }
+  }
+  for (const resource of resources) {
+    if (!visited.has(resource.id)) levels.set(resource.id, Math.max(0, ...Array.from(levels.values())));
+  }
+  const buckets = new Map();
+  for (const resource of resources) {
+    const level = levels.get(resource.id);
+    if (!buckets.has(level)) buckets.set(level, []);
+    buckets.get(level).push(resource);
+  }
+  const positions = new Map();
+  for (const [level, bucket] of buckets) {
+    bucket.forEach((resource, index) => {
+      if (!state.graphPositions.has(resource.id)) {
+        state.graphPositions.set(resource.id, {x: 70 + level * 300, y: 52 + index * 128});
+      }
+      positions.set(resource.id, state.graphPositions.get(resource.id));
+    });
+  }
+  const maxLevel = Math.max(0, ...Array.from(buckets.keys()));
+  const maxRows = Math.max(1, ...Array.from(buckets.values(), (bucket) => bucket.length));
+  return {
+    positions,
+    width: Math.max(860, (maxLevel + 1) * 300 + 70),
+    height: Math.max(380, maxRows * 128 + 45)
+  };
+}
+
+function graphNodeMarkup(resource, position) {
+  const [iconClass, icon] = nodeIcon(resource.category);
+  const iconColor = iconClass === "compute" ? "#c9862c" : iconClass === "database" ? "#398bc0" : iconClass === "network" ? "#655be0" : iconClass === "storage" ? "#348c6f" : "#756bec";
+  return `<g class="graph-node" data-resource-id="${escapeHtml(resource.id)}" transform="translate(${position.x} ${position.y})" tabindex="0" role="button" aria-label="${escapeHtml(resource.service)} ${escapeHtml(resource.id)}"><rect class="node-card" width="188" height="78" rx="10"></rect><circle cx="25" cy="25" r="14" fill="${iconColor}" opacity=".12"></circle><text class="graph-node-icon" x="25" y="29" text-anchor="middle" fill="${iconColor}">${icon}</text><text class="graph-node-service" x="48" y="22">${escapeHtml(resource.service).slice(0, 22)}</text><text class="graph-node-category" x="48" y="37">${escapeHtml(resource.category).slice(0, 23)}</text><text class="graph-node-id" x="12" y="61">${escapeHtml(resource.id).slice(0, 29)}</text><circle class="node-port" cx="0" cy="39" r="4"></circle><circle class="node-port" cx="188" cy="39" r="4"></circle></g>`;
+}
+
+function initializeArchitectureGraph() {
+  const svg = $("#architecture-graph");
+  if (!svg) return;
+  const world = $("#graph-world");
+  const viewport = $("#graph-viewport");
+  const inspector = $("#graph-inspector");
+  const positions = state.graphPositions;
+  const connections = state.graphConnections;
+  const dimensions = state.graphDimensions;
+  const connectionsGroup = $("#graph-connections");
+  const updateTransform = () => world.setAttribute("transform", `translate(${state.graphTransform.x} ${state.graphTransform.y}) scale(${state.graphTransform.scale})`);
+  const pointInSvg = (event) => {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    return point.matrixTransform(svg.getScreenCTM().inverse());
+  };
+  const pointInWorld = (event) => {
+    const point = pointInSvg(event);
+    return point.matrixTransform(world.getScreenCTM().inverse());
+  };
+  const edgePath = (connection, connectionIndex) => {
+    const source = positions.get(connection.source);
+    const target = positions.get(connection.target);
+    if (!source || !target) return "";
+    const parallel = connections
+      .map((candidate, index) => ({candidate, index}))
+      .filter(({candidate}) => candidate.source === connection.source && candidate.target === connection.target);
+    const parallelIndex = parallel.findIndex(({index}) => index === connectionIndex);
+    const offset = (parallelIndex - (parallel.length - 1) / 2) * 14;
+    const forward = target.x >= source.x;
+    const startX = source.x + (forward ? 188 : 0);
+    const endX = target.x + (forward ? 0 : 188);
+    const startY = source.y + 39 + offset;
+    const endY = target.y + 39 + offset;
+    const curve = Math.max(38, Math.abs(endX - startX) * 0.42);
+    const direction = forward ? 1 : -1;
+    return `M ${startX} ${startY} C ${startX + curve * direction} ${startY}, ${endX - curve * direction} ${endY}, ${endX} ${endY}`;
+  };
+  const updateConnections = () => {
+    connectionsGroup.querySelectorAll(".graph-connection").forEach((group, index) => {
+      const path = edgePath(connections[index], index);
+      group.querySelector(".connection-line").setAttribute("d", path);
+      const hitPath = group.querySelector(".connection-hit");
+      hitPath.setAttribute("d", path);
+      group.querySelector(".connection-line").setAttribute("id", `connection-path-${index}`);
+    });
+  };
+  const fit = () => {
+    state.graphTransform = {x: 0, y: 0, scale: 1};
+    updateTransform();
+  };
+  const showNodeDetails = (resourceId) => {
+    const resource = state.analysis.resources.find((item) => item.id === resourceId);
+    if (!resource) return;
+    state.selectedGraphNode = resourceId;
+    state.selectedConnection = null;
+    svg.querySelectorAll(".graph-node").forEach((node) => {
+      const selected = node.dataset.resourceId === resourceId;
+      const connected = connections.some((connection) => (
+        (connection.source === resourceId && connection.target === node.dataset.resourceId)
+        || (connection.target === resourceId && connection.source === node.dataset.resourceId)
+      ));
+      node.classList.toggle("selected", selected);
+      node.classList.toggle("connected", connected);
+      node.classList.toggle("dimmed", !selected && !connected);
+    });
+    connectionsGroup.querySelectorAll(".graph-connection").forEach((edge, index) => {
+      const connected = connections[index].source === resourceId || connections[index].target === resourceId;
+      edge.classList.toggle("selected", connected);
+      edge.classList.toggle("dimmed", !connected);
+    });
+    const related = connections.map((connection, index) => ({connection, index})).filter(({connection}) => (
+      connection.source === resourceId || connection.target === resourceId
+    ));
+    inspector.innerHTML = `<div class="graph-inspector-head"><span class="graph-detail-icon">${escapeHtml(resource.category)}</span><div><strong>${escapeHtml(resource.service)}</strong><small>${escapeHtml(resource.id)}</small></div><button class="button button-secondary button-small" data-open-resource="${escapeHtml(resource.id)}">Full resource details</button></div><p class="graph-inspector-description">${escapeHtml(resource.purpose)}</p><div class="connection-list-title">${related.length} related connection${related.length === 1 ? "" : "s"}</div><div class="connection-list">${related.map(({connection, index}) => connectionCard(connection, index)).join("") || '<div class="empty-state">No direct connections were detected for this resource.</div>'}</div>`;
+    wireInspector();
+  };
+  const showConnectionDetails = (index) => {
+    const connection = connections[index];
+    if (!connection) return;
+    state.selectedConnection = index;
+    state.selectedGraphNode = null;
+    svg.querySelectorAll(".graph-node").forEach((node) => {
+      node.classList.toggle("selected", node.dataset.resourceId === connection.source || node.dataset.resourceId === connection.target);
+      node.classList.toggle("dimmed", node.dataset.resourceId !== connection.source && node.dataset.resourceId !== connection.target);
+      node.classList.remove("connected");
+    });
+    connectionsGroup.querySelectorAll(".graph-connection").forEach((edge, edgeIndex) => {
+      edge.classList.toggle("selected", edgeIndex === index);
+      edge.classList.toggle("dimmed", edgeIndex !== index);
+    });
+    inspector.innerHTML = connectionDetailMarkup(connection);
+    wireInspector();
+  };
+  const wireInspector = () => {
+    inspector.querySelectorAll("[data-resource-id]").forEach((button) => button.addEventListener("click", () => showNodeDetails(button.dataset.resourceId)));
+    inspector.querySelectorAll("[data-open-resource]").forEach((button) => button.addEventListener("click", () => openResource(button.dataset.openResource)));
+    inspector.querySelectorAll("[data-connection-index]").forEach((button) => button.addEventListener("click", () => showConnectionDetails(Number(button.dataset.connectionIndex))));
+  };
+  const wireGraphEvents = () => {
+    svg.querySelectorAll(".graph-node").forEach((node) => {
+      node.addEventListener("click", (event) => {
+        if (node.dataset.dragged === "true") {
+          node.dataset.dragged = "false";
+          return;
+        }
+        event.stopPropagation();
+        showNodeDetails(node.dataset.resourceId);
+      });
+      node.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          showNodeDetails(node.dataset.resourceId);
+        }
+      });
+      node.addEventListener("pointerdown", (event) => {
+        event.stopPropagation();
+        node.setPointerCapture(event.pointerId);
+        const start = pointInWorld(event);
+        const initial = positions.get(node.dataset.resourceId);
+        const offset = {x: start.x - initial.x, y: start.y - initial.y};
+        node.dataset.dragged = "false";
+        const move = (moveEvent) => {
+          const point = pointInWorld(moveEvent);
+          if (Math.abs(point.x - start.x) + Math.abs(point.y - start.y) > 3) node.dataset.dragged = "true";
+          const next = {x: Math.max(8, point.x - offset.x), y: Math.max(8, point.y - offset.y)};
+          positions.set(node.dataset.resourceId, next);
+          node.setAttribute("transform", `translate(${next.x} ${next.y})`);
+          updateConnections();
+        };
+        const end = () => {
+          node.removeEventListener("pointermove", move);
+          node.removeEventListener("pointerup", end);
+          node.removeEventListener("pointercancel", end);
+        };
+        node.addEventListener("pointermove", move);
+        node.addEventListener("pointerup", end);
+        node.addEventListener("pointercancel", end);
+      });
+    });
+    connectionsGroup.querySelectorAll(".graph-connection").forEach((edge, index) => {
+      edge.addEventListener("click", (event) => {
+        event.stopPropagation();
+        showConnectionDetails(index);
+      });
+    });
+    svg.addEventListener("click", (event) => {
+      if (event.target.closest(".graph-node, .graph-connection")) return;
+      state.selectedGraphNode = null;
+      state.selectedConnection = null;
+      inspector.innerHTML = '<div class="graph-inspector-empty"><span>↖</span><strong>Select a resource or connection</strong><small>Inspect what connects services and how Terraform wires them together.</small></div>';
+      svg.querySelectorAll(".graph-node, .graph-connection").forEach((item) => item.classList.remove("selected", "connected", "dimmed"));
+    });
+    let panStart = null;
+    svg.addEventListener("pointerdown", (event) => {
+      if (event.target.closest(".graph-node, .graph-connection")) return;
+      panStart = {x: event.clientX, y: event.clientY, originX: state.graphTransform.x, originY: state.graphTransform.y};
+      svg.setPointerCapture(event.pointerId);
+    });
+    svg.addEventListener("pointermove", (event) => {
+      if (!panStart) return;
+      const screenScale = Math.min(svg.clientWidth / dimensions.width, svg.clientHeight / dimensions.height);
+      state.graphTransform.x = panStart.originX + (event.clientX - panStart.x) / screenScale;
+      state.graphTransform.y = panStart.originY + (event.clientY - panStart.y) / screenScale;
+      updateTransform();
+    });
+    const stopPan = () => { panStart = null; };
+    svg.addEventListener("pointerup", stopPan);
+    svg.addEventListener("pointercancel", stopPan);
+    svg.addEventListener("wheel", (event) => {
+      event.preventDefault();
+      const oldScale = state.graphTransform.scale;
+      const nextScale = Math.min(3, Math.max(0.3, oldScale * (event.deltaY < 0 ? 1.1 : 0.9)));
+      const point = pointInSvg(event);
+      const px = point.x;
+      const py = point.y;
+      state.graphTransform.x = px - (px - state.graphTransform.x) * (nextScale / oldScale);
+      state.graphTransform.y = py - (py - state.graphTransform.y) * (nextScale / oldScale);
+      state.graphTransform.scale = nextScale;
+      updateTransform();
+    }, {passive: false});
+  };
+  updateTransform();
+  updateConnections();
+  wireGraphEvents();
+  fit();
+  viewport.closest(".panel").querySelectorAll("[data-graph-action]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.graphAction === "fit") fit();
+      if (button.dataset.graphAction === "zoom-in" || button.dataset.graphAction === "zoom-out") {
+        state.graphTransform.scale = Math.min(3, Math.max(0.3, state.graphTransform.scale * (button.dataset.graphAction === "zoom-in" ? 1.2 : 0.8)));
+        updateTransform();
+      }
+      if (button.dataset.graphAction === "play") {
+        state.graphPlaying = !state.graphPlaying;
+        svg.classList.toggle("playing", state.graphPlaying);
+        button.classList.toggle("active", state.graphPlaying);
+        button.textContent = state.graphPlaying ? "Ⅱ Pause flow" : "▶ Play flow";
+      }
+    });
+  });
+  viewport.closest(".panel").querySelectorAll("[data-graph-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.graphMode = button.dataset.graphMode;
+      state.selectedGraphNode = null;
+      state.selectedConnection = null;
+      renderActivePanel();
+    });
+  });
+  function connectionCard(connection, index) {
+    const from = state.analysis.resources.find((resource) => resource.id === connection.source);
+    const to = state.analysis.resources.find((resource) => resource.id === connection.target);
+    return `<button class="connection-card ${connection.flowType}" data-connection-index="${index}"><span class="connection-card-type">${connection.flowType === "runtime" ? "EVENT FLOW" : "TERRAFORM REFERENCE"}</span><span class="connection-card-route">${escapeHtml(from?.service || connection.source)} <i>→</i> ${escapeHtml(to?.service || connection.target)}</span><span class="connection-card-reason">${escapeHtml(connection.description || connection.label || "Resource reference")}</span></button>`;
+  }
+  function connectionDetailMarkup(connection) {
+    const from = state.analysis.resources.find((resource) => resource.id === connection.source);
+    const to = state.analysis.resources.find((resource) => resource.id === connection.target);
+    const runtime = connection.flowType === "runtime";
+    const via = runtime ? state.analysis.resources.find((resource) => resource.id === connection.via) : null;
+    return `<div class="connection-detail"><div class="connection-detail-heading"><span class="connection-detail-icon ${runtime ? "runtime" : ""}">${runtime ? "⇢" : "↗"}</span><div><strong>${runtime ? "Runtime event flow" : "Terraform resource reference"}</strong><small>${runtime ? "Inferred from an explicit trigger resource" : "Directly referenced in configuration"}</small></div></div><p>${escapeHtml(connection.description || "")}</p><div class="connection-endpoints"><button data-resource-id="${escapeHtml(connection.source)}"><span>FROM</span><strong>${escapeHtml(from?.service || connection.source)}</strong><small>${escapeHtml(connection.source)}</small></button><span class="endpoint-arrow">→</span><button data-resource-id="${escapeHtml(connection.target)}"><span>TO</span><strong>${escapeHtml(to?.service || connection.target)}</strong><small>${escapeHtml(connection.target)}</small></button></div>${runtime ? `<div class="connection-metadata"><div><span>Trigger resource</span><button data-resource-id="${escapeHtml(connection.via)}">${escapeHtml(via?.service || connection.via)}</button></div><div><span>Detected event</span><strong>${escapeHtml(connection.event || connection.label)}</strong></div></div>` : `<div class="connection-metadata"><div><span>Attribute on consumer</span><strong>${escapeHtml(connection.attribute || "Reference")}</strong></div><div><span>Referenced value</span><strong>${escapeHtml(connection.referenced_value || "Resource value")}</strong></div><div class="expression-row"><span>Terraform expression</span><code>${escapeHtml(connection.expression || "")}</code></div></div>`}</div>`;
+  }
 }
 
 function renderRuntime() {

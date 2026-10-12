@@ -37,6 +37,7 @@ resource "aws_s3_bucket_notification" "uploads" {
   bucket = aws_s3_bucket.uploads.id
   lambda_function {
     lambda_function_arn = aws_lambda_function.processor.arn
+    events              = ["s3:ObjectCreated:*"]
   }
 }
 resource "aws_instance" "worker" {
@@ -45,13 +46,35 @@ resource "aws_instance" "worker" {
         }
         result = analyze_files(files)
         self.assertEqual(5, result["resource_count"])
-        self.assertEqual(
-            [{"source": "aws_s3_bucket.uploads", "target": "aws_lambda_function.processor", "label": "Object event"}],
-            result["runtime_flows"],
-        )
+        event_flow = result["runtime_flows"][0]
+        self.assertEqual("aws_s3_bucket.uploads", event_flow["source"])
+        self.assertEqual("aws_lambda_function.processor", event_flow["target"])
+        self.assertEqual("Object event", event_flow["label"])
+        self.assertEqual("aws_s3_bucket_notification.uploads", event_flow["via"])
+        self.assertEqual("s3:ObjectCreated:*", event_flow["event"])
+        self.assertIn("via S3 Event Notifications", event_flow["description"])
         self.assertTrue(any(item["title"] == "Public bucket ACL" for item in result["security"]["findings"]))
         self.assertEqual(25, result["cost"]["monthly_min_usd"])
-        self.assertTrue(any(edge["source"] == "aws_iam_role.processor" for edge in result["edges"]))
+        role_reference = next(edge for edge in result["edges"] if edge["source"] == "aws_iam_role.processor")
+        self.assertEqual("role", role_reference["attribute"])
+        self.assertEqual("arn", role_reference["referenced_value"])
+        self.assertEqual("aws_iam_role.processor.arn", role_reference["expression"])
+        self.assertIn("for role", role_reference["description"])
+
+    def test_data_source_references_have_full_address_and_connection_context(self):
+        result = analyze_files({
+            "main.tf": '''data "aws_vpc" "selected" {
+  default = true
+}
+resource "aws_instance" "worker" {
+  subnet_id = data.aws_vpc.selected.id
+}'''
+        })
+        edge = result["edges"][0]
+        self.assertEqual("data.aws_vpc.selected", edge["source"])
+        self.assertEqual("aws_instance.worker", edge["target"])
+        self.assertEqual("subnet_id", edge["attribute"])
+        self.assertEqual("id", edge["referenced_value"])
 
     def test_state_is_ignored_and_warned(self):
         result = analyze_files({
