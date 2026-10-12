@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f7f8fa" />
+    <title>TerraScope — Terraform Architecture Explorer</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <a class="brand" href="/" aria-label="TerraScope home">
+          <span class="brand-mark" aria-hidden="true">T</span>
+          <span><strong>terrascope</strong><small>INFRASTRUCTURE INSIGHTS</small></span>
+        </a>
+        <div class="workspace-label">WORKSPACE</div>
+        <button class="workspace-switch"><span class="workspace-dot"></span><span id="workspace-name">No project loaded</span><span class="chevron">⌄</span></button>
+        <div class="nav-label">ANALYZE</div>
+        <nav class="main-nav" aria-label="Analysis sections">
+          <button class="nav-item active" data-view="overview"><span class="nav-icon">◫</span>Overview</button>
+          <button class="nav-item" data-view="architecture"><span class="nav-icon">⌘</span>Architecture</button>
+          <button class="nav-item" data-view="runtime"><span class="nav-icon">⇢</span>Runtime flow</button>
+          <button class="nav-item" data-view="resources"><span class="nav-icon">▦</span>Resources<span class="nav-count" id="resource-nav-count">0</span></button>
+          <button class="nav-item" data-view="security"><span class="nav-icon">◈</span>Security<span class="nav-count warning-count" id="risk-nav-count">0</span></button>
+          <button class="nav-item" data-view="cost"><span class="nav-icon">$</span>Cost estimate</button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="local-note"><span class="shield">◇</span><span><strong>Private by design</strong><small>Raw Terraform stays local.</small></span></div>
+          <div class="sidebar-user"><span class="avatar">TS</span><span><strong>Local workspace</strong><small>Personal project</small></span><span class="more">···</span></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="breadcrumbs"><span>Workspace</span><span class="crumb-sep">/</span><strong id="breadcrumb-project">Overview</strong></div>
+          <div class="topbar-actions"><span class="local-status"><i></i> Analyzed locally</span><button class="button button-secondary button-small" id="header-upload">↥ <span>Upload Terraform</span></button></div>
+        </header>
+        <section class="content">
+          <div class="page-heading">
+            <div><div class="eyebrow">INFRASTRUCTURE INTELLIGENCE</div><h1 id="page-title">Understand your infrastructure.</h1><p id="page-subtitle">Turn Terraform into a clear, explorable map of your cloud architecture.</p></div>
+            <button class="button button-primary" id="upload-button"><span>↥</span> Upload Terraform</button>
+          </div>
+
+          <section class="welcome-panel" id="welcome-panel">
+            <div class="welcome-copy">
+              <span class="welcome-icon">✳</span>
+              <div><h2>Bring your infrastructure into focus</h2><p>Upload Terraform files or a project folder. We’ll map your services, connections, security signals, and likely cost drivers.</p></div>
+            </div>
+            <div class="upload-zone" id="drop-zone" tabindex="0" role="button" aria-label="Choose Terraform files or project folder">
+              <div class="upload-symbol">↑</div><strong>Drop Terraform files here</strong><span>or <button id="browse-files" class="text-button">browse your computer</button></span>
+              <small>Accepts .tf and .tf.json · State files are ignored</small>
+            </div>
+            <div class="welcome-footer"><span>✦ No Terraform expertise needed</span><button class="text-button" id="load-sample">Explore a sample project <span>→</span></button></div>
+          </section>
+
+          <div class="analysis-area hidden" id="analysis-area">
+            <div class="metrics-grid" id="metrics-grid"></div>
+            <section class="panel summary-panel">
+              <div class="panel-title-row"><div><div class="eyebrow">THE BIG PICTURE</div><h2>Architecture summary</h2></div><div class="ai-actions"><span class="ai-badge" id="ai-status">Checking Gemini…</span><button class="button button-secondary button-small" id="gemini-button" disabled>✦ Ask Gemini</button></div></div>
+              <p class="summary-text" id="summary-text"></p>
+              <div class="summary-foot"><span class="summary-dot"></span>Static summary. Optional Gemini analysis sends sanitized architecture details to Google; raw Terraform source is not sent.</div>
+              <div class="gemini-output hidden" id="gemini-output" aria-live="polite"></div>
+            </section>
+            <section class="panel" id="active-panel"></section>
+            <div class="disclaimer-row" id="disclaimer"></div>
+          </div>
+          <div class="toast hidden" id="toast" role="status"></div>
+          <input id="file-input" type="file" multiple accept=".tf,.json,.tf.json" hidden />
+          <input id="folder-input" type="file" multiple webkitdirectory hidden />
+        </section>
+      </main>
+      <aside class="detail-drawer hidden" id="detail-drawer" aria-label="Resource details">
+        <button class="drawer-close" id="drawer-close" aria-label="Close resource details">×</button>
+        <div id="drawer-content"></div>
+      </aside>
+    </div>
+  </body>
+</html>
